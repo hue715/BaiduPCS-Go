@@ -4,7 +4,7 @@ name="BaiduPCS-Go"
 version=$1
 
 if [ "$1" = "" ]; then
-  version=v3.7.0
+  version=v3.7.3
 fi
 
 output="out/"
@@ -45,10 +45,10 @@ IOSBuild() {
   mkdir -p "$output/$1"
   cd "$output/$1"
   export CC=/usr/local/go/misc/ios/clangwrap.sh GOOS=darwin GOARCH=arm GOARM=7 CGO_ENABLED=1
-  go build -ldflags "-X main.Version=$version -s -w" -o "armv7" github.com/iikira/BaiduPCS-Go
+  go build -ldflags "-X main.Version=$version -s -w" -o "armv7" github.com/Erope/BaiduPCS-Go
   jtool --sign --inplace --ent ../../entitlements.xml "armv7"
   export GOARCH=arm64
-  go build -ldflags "-X main.Version=$version -s -w" -o "arm64" github.com/iikira/BaiduPCS-Go
+  go build -ldflags "-X main.Version=$version -s -w" -o "arm64" github.com/Erope/BaiduPCS-Go
   jtool --sign --inplace --ent ../../entitlements.xml "arm64"
   lipo -create "armv7" "arm64" -output $name # merge
   rm "armv7" "arm64"
@@ -88,7 +88,6 @@ touch ./vendor/golang.org/x/sys/windows/windows.s
 
 # iOS
 # IOSBuild $name-$version"-darwin-ios-arm"
-
 # OS X / macOS
 Build $name-$version"-darwin-osx-amd64" darwin amd64
 # Build $name-$version"-darwin-osx-386" darwin 386
@@ -119,9 +118,9 @@ Build $name-$version"-freebsd-arm" freebsd arm
 # Build $name-$version"-netbsd-386" netbsd  386
 # Build $name-$version"-netbsd-amd64" netbsd amd64
 # Build $name-$version"-netbsd-arm" netbsd  arm
-# Build $name-$version"-openbsd-386" openbsd 386
-# Build $name-$version"-openbsd-amd64" openbsd  amd64
-# Build $name-$version"-openbsd-arm" openbsd arm
+Build $name-$version"-openbsd-386" openbsd 386
+Build $name-$version"-openbsd-amd64" openbsd  amd64
+Build $name-$version"-openbsd-arm" openbsd arm
 # Build $name-$version"-plan9-386" plan9 386
 # Build $name-$version"-plan9-amd64" plan9 amd64
 # Build $name-$version"-plan9-arm" plan9 arm

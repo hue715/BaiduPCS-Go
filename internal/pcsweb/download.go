@@ -1,32 +1,36 @@
 package pcsweb
 
 import (
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
-	"github.com/iikira/BaiduPCS-Go/baidupcs"
-	"github.com/iikira/BaiduPCS-Go/baidupcs/pcserror"
-	"github.com/iikira/BaiduPCS-Go/internal/pcscommand"
-	"github.com/iikira/BaiduPCS-Go/internal/pcsconfig"
-	"github.com/iikira/BaiduPCS-Go/internal/pcsfunctions/pcsdownload"
-	"github.com/iikira/BaiduPCS-Go/pcstable"
-	"github.com/iikira/BaiduPCS-Go/pcsutil/checksum"
-	"github.com/iikira/BaiduPCS-Go/pcsutil/converter"
-	"github.com/iikira/BaiduPCS-Go/pcsutil/waitgroup"
-	"github.com/iikira/BaiduPCS-Go/requester"
-	"github.com/iikira/BaiduPCS-Go/requester/downloader"
-	"github.com/iikira/BaiduPCS-Go/requester/transfer"
+	"github.com/Erope/BaiduPCS-Go/baidupcs"
+	"github.com/Erope/BaiduPCS-Go/baidupcs/pcserror"
+	"github.com/Erope/BaiduPCS-Go/internal/pcscommand"
+	"github.com/Erope/BaiduPCS-Go/internal/pcsconfig"
+	"github.com/Erope/BaiduPCS-Go/internal/pcsfunctions/pcsdownload"
+	"github.com/Erope/BaiduPCS-Go/pcstable"
+	"github.com/Erope/BaiduPCS-Go/pcsutil/checksum"
+	"github.com/Erope/BaiduPCS-Go/pcsutil/converter"
+	"github.com/Erope/BaiduPCS-Go/pcsutil/waitgroup"
+	"github.com/Erope/BaiduPCS-Go/requester"
+	"github.com/Erope/BaiduPCS-Go/requester/downloader"
+	"github.com/Erope/BaiduPCS-Go/requester/transfer"
 	"github.com/oleiade/lane"
+	"github.com/zyxar/argo/rpc"
 	"golang.org/x/net/websocket"
 )
 
@@ -288,6 +292,43 @@ func checkFileValid(filePath string, fileInfo *baidupcs.FileDirectory) error {
 
 // RunDownload 执行下载网盘内文件
 func RunDownload(conn *websocket.Conn, paths []string, options *DownloadOptions) {
+	if Aria2 {
+		//发送下载链接到Aria2
+		opts := make(map[string]interface{})
+		opts["user-agent"] = pcsconfig.Config.PanUA
+		opts["stream-piece-selector"] = "inorder"
+		if pcsconfig.Config.MaxParallel > 16 {
+			opts["max-connection-per-server"] = 16
+		} else {
+			opts["max-connection-per-server"] = pcsconfig.Config.MaxParallel
+		}
+		rpcc, err := rpc.New(context.Background(), Aria2_Url, Aria2_Secret, time.Second, nil)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+		for k := range paths {
+			rawDlinks, err := getLocateDownloadLinks(paths[k])
+			if len(PD_Url) >= 4 {
+				opts["user-agent"] = "LogStatistic"
+			} else {
+				opts["user-agent"] = pcsconfig.Config.PanUA
+			}
+			if err == nil {
+				handleHTTPLinkURL(rawDlinks[0])
+				gid, err := rpcc.AddURI(Aria2_prefix+rawDlinks[0].String(), opts)
+				if err == nil {
+					fmt.Printf("成功将 %s 送入Aria2下载列表，并发数: %d，gid: %s\n", paths[k], opts["max-connection-per-server"], gid)
+				} else {
+					fmt.Printf("添加任务到aria2时出错: %s 请检查aria2配置是否正确\n", err)
+				}
+			} else {
+				fmt.Printf("出错: %s\n", err)
+			}
+		}
+		rpcc.Close()
+		return
+	}
 	if options == nil {
 		options = &DownloadOptions{}
 	}
@@ -755,18 +796,87 @@ func RunFixMD5(pcspaths ...string) {
 }
 
 func getLocateDownloadLinks(pcspath string) (dlinks []*url.URL, err error) {
-	pcs := pcscommand.GetBaiduPCS()
-	dInfo, pcsError := pcs.LocateDownload(pcspath)
-	if pcsError != nil {
-		return nil, pcsError
-	}
+	if len(PD_Url) < 4 {
+		pcs := pcscommand.GetBaiduPCS()
+		dInfo, pcsError := pcs.LocateDownload(pcspath)
+		if pcsError != nil {
+			return nil, pcsError
+		}
 
-	us := dInfo.URLStrings(pcsconfig.Config.EnableHTTPS)
-	if len(us) == 0 {
+		us := dInfo.URLStrings(pcsconfig.Config.EnableHTTPS)
+		if len(us) == 0 {
+			return nil, ErrDlinkNotFound
+		}
+		config := pcsconfig.Config
+		config.SetPanUA("netdisk;2.2.51.6;netdisk;10.0.63;PC;android-android")
+		return us, nil
+	}
+	// 获取Pandownload网页版下载链接
+	// 先分享拿到分享链接
+	paths := make([]string, 0, 10)
+	fmt.Printf("检测到开启了Pandownload网页版加速功能，正在为%s 获取分享链接\n", pcspath)
+	paths = append(paths, pcspath)
+	shared, err := pcsconfig.Config.ActiveUserBaiduPCS().ShareSet(paths, nil)
+	if err != nil {
+		return nil, ErrDlinkNotFound
+	}
+	fmt.Printf("获取的分享链接为: %s, 密码为pass\n", shared.Link)
+	surl := strings.TrimPrefix(shared.Link, "https://pan.baidu.com/s/")
+
+	// 再请求Pandownload网页版
+	fmt.Printf("正在请求PD网页版获取文件列表: %s\n", PD_Url+"list")
+	resp, err := http.Post(PD_Url+"list",
+		"application/x-www-form-urlencoded",
+		strings.NewReader("surl="+surl+"&pwd=pass"))
+	if err != nil {
 		return nil, ErrDlinkNotFound
 	}
 
-	return us, nil
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, ErrDlinkNotFound
+	}
+	flysnowRegexp := regexp.MustCompile(`dl\('(.*)',(.*),'(.*)','(.*)','(.*)','(.*)'\)`)
+	params := flysnowRegexp.FindStringSubmatch(string(body))
+
+	if len(params) < 6 {
+		fmt.Printf("文件列表请求失败!\n")
+		return nil, ErrDlinkNotFound
+	}
+	// 最终获得下载link
+	fmt.Printf("正在请求PD网页版获取下载链接: %s\n", PD_Url+"download")
+	resp, err = http.Post(PD_Url+"download",
+		"application/x-www-form-urlencoded",
+		strings.NewReader("fs_id="+params[1]+"&time="+params[2]+"&sign="+params[3]+"&randsk="+params[4]+"&share_id="+params[5]+"&uk="+params[6]))
+	if err != nil {
+		return nil, ErrDlinkNotFound
+	}
+	defer resp.Body.Close()
+	body, err = ioutil.ReadAll(resp.Body)
+	if err != nil {
+		fmt.Printf("网页未回复或出错...\n")
+		return nil, ErrDlinkNotFound
+	}
+	// 获取http下载link
+	if pcsconfig.Config.EnableHTTPS {
+		flysnowRegexp = regexp.MustCompile(`(?U)id="https" href="(.*)"`)
+	} else {
+		flysnowRegexp = regexp.MustCompile(`(?U)id="http" href="(.*)"`)
+	}
+	params = flysnowRegexp.FindStringSubmatch(string(body))
+
+	if len(params) < 1 {
+		fmt.Printf("无法获取下载链接...\n")
+		return nil, ErrDlinkNotFound
+	}
+	urls := make([]*url.URL, 0, 10)
+	u, err := url.Parse(params[1])
+	urls = append(urls, u)
+	config := pcsconfig.Config
+	config.SetPanUA("LogStatistic")
+	fmt.Printf("成功获取下载链接: %s\n", params[1])
+	return urls, nil
 }
 
 func getLocatePanLink(pcs *baidupcs.BaiduPCS, fsID int64) (dlink string, err error) {
